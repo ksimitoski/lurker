@@ -1,6 +1,5 @@
 import os
 import socket
-# pyrefly: ignore [missing-import]
 import pytest
 import tempfile
 import shutil
