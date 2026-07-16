@@ -42,6 +42,30 @@ def simulate_request(handler_class, method, path, headers=None):
     mock_request.wfile.seek(0)
     return mock_request.wfile.read()
 
+def simulate_post_request(handler_class, path, body_params=None, headers=None):
+    if headers is None:
+        headers = {}
+    
+    body_bytes = b""
+    if body_params:
+        body_str = urllib.parse.urlencode(body_params, doseq=True)
+        body_bytes = body_str.encode('utf-8')
+        headers["Content-Length"] = str(len(body_bytes))
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+
+    req_line = f"POST {path} HTTP/1.1\r\n"
+    header_lines = ""
+    for k, v in headers.items():
+        header_lines += f"{k}: {v}\r\n"
+        
+    request_data = (req_line + header_lines + "\r\n").encode('utf-8') + body_bytes
+    
+    mock_request = MockRequest(request_data)
+    handler_class(mock_request, ('127.0.0.1', 12345), MockServer())
+    
+    mock_request.wfile.seek(0)
+    return mock_request.wfile.read()
+
 @pytest.fixture
 def temp_output_dir():
     temp_dir = tempfile.mkdtemp()
@@ -246,3 +270,102 @@ def test_main_startup(mock_http_server_class, mock_run_tcp_server):
             mock_http_server_class.assert_called_once()
             mock_httpd.serve_forever.assert_called_once()
             mock_httpd.server_close.assert_called_once()
+
+def test_web_handler_delete_single_success(temp_output_dir):
+    filename = "test-delete-file"
+    file_path = os.path.join(temp_output_dir, filename)
+    with open(file_path, "wb") as f:
+        f.write(b"content")
+
+    assert os.path.exists(file_path)
+
+    handler_class = lurker_web.make_handler(temp_output_dir)
+    response = simulate_post_request(handler_class, "/delete-single", {"delete_single": [filename]})
+
+    assert b"303 See Other" in response or b"303" in response
+    assert not os.path.exists(file_path)
+
+def test_web_handler_delete_single_missing(temp_output_dir):
+    handler_class = lurker_web.make_handler(temp_output_dir)
+    response = simulate_post_request(handler_class, "/delete-single", {"delete_single": ["non-existent"]})
+
+    assert b"404 File Not Found" in response
+
+def test_web_handler_delete_single_traversal(temp_output_dir):
+    # Try directory traversal using path component
+    handler_class = lurker_web.make_handler(temp_output_dir)
+    
+    # 1. Dot path
+    response = simulate_post_request(handler_class, "/delete-single", {"delete_single": ["."]})
+    assert b"400 Bad Request" in response
+
+    # 2. Directory traversal attempt
+    parent_dir = os.path.dirname(temp_output_dir)
+    secret_filename = "secret_delete_test.txt"
+    secret_file_path = os.path.join(parent_dir, secret_filename)
+    with open(secret_file_path, "wb") as f:
+        f.write(b"secret content")
+
+    try:
+        # Try to delete using relative path traversal
+        response = simulate_post_request(handler_class, "/delete-single", {"delete_single": [f"../{secret_filename}"]})
+        # Basename will strip and seek within temp_output_dir, failing with 404 since it's not there
+        assert b"404" in response
+        assert os.path.exists(secret_file_path)
+    finally:
+        if os.path.exists(secret_file_path):
+            os.remove(secret_file_path)
+
+def test_web_handler_delete_selected_success(temp_output_dir):
+    file1 = "file1.txt"
+    file2 = "file2.txt"
+    path1 = os.path.join(temp_output_dir, file1)
+    path2 = os.path.join(temp_output_dir, file2)
+    
+    with open(path1, "wb") as f: f.write(b"one")
+    with open(path2, "wb") as f: f.write(b"two")
+
+    handler_class = lurker_web.make_handler(temp_output_dir)
+    response = simulate_post_request(handler_class, "/delete-selected", {"files": [file1, file2]})
+
+    assert b"303" in response
+    assert not os.path.exists(path1)
+    assert not os.path.exists(path2)
+
+def test_web_handler_download_selected_zip_success(temp_output_dir):
+    file1 = "uuid-file1.txt"
+    file2 = "uuid-file2.png"
+    path1 = os.path.join(temp_output_dir, file1)
+    path2 = os.path.join(temp_output_dir, file2)
+    
+    with open(path1, "wb") as f: f.write(b"content 1")
+    with open(path2, "wb") as f: f.write(b"content 2")
+
+    handler_class = lurker_web.make_handler(temp_output_dir)
+    response = simulate_post_request(handler_class, "/download-selected", {"files": [file1, file2]})
+
+    assert b"200 OK" in response
+    assert b"Content-Type: application/zip" in response
+    assert b"Content-Disposition: attachment; filename=" in response
+
+    # Parse response to find zip file bytes
+    parts = response.split(b"\r\n\r\n", 1)
+    assert len(parts) == 2
+    zip_bytes = parts[1]
+
+    # Verify zip content
+    import zipfile
+    import io
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        # Files should be stored under full filename (uuid-file1.txt, uuid-file2.png)
+        namelist = z.namelist()
+        assert "uuid-file1.txt" in namelist
+        assert "uuid-file2.png" in namelist
+        assert z.read("uuid-file1.txt") == b"content 1"
+        assert z.read("uuid-file2.png") == b"content 2"
+
+def test_web_handler_download_selected_zip_empty(temp_output_dir):
+    handler_class = lurker_web.make_handler(temp_output_dir)
+    response = simulate_post_request(handler_class, "/download-selected", {"files": []})
+
+    assert b"400" in response

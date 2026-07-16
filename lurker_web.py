@@ -4,6 +4,8 @@ import sys
 import uuid
 import logging
 import threading
+import zipfile
+import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
 from datetime import datetime
@@ -205,6 +207,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             --accent-color: #3b82f6;
             --accent-hover: #2563eb;
             --accent-glow: rgba(59, 130, 246, 0.15);
+            --danger-color: #ef4444;
+            --danger-hover: #dc2626;
+            --danger-glow: rgba(239, 68, 68, 0.15);
             --row-hover: #1f2937;
         }}
 
@@ -255,6 +260,68 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             font-weight: 500;
         }}
 
+        .actions-bar {{
+            display: none;
+            align-items: center;
+            justify-content: space-between;
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1rem 1.5rem;
+            margin-bottom: 1.5rem;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+        }}
+
+        .actions-bar.active {{
+            display: flex;
+            animation: fadeIn 0.2s ease;
+        }}
+
+        .actions-buttons {{
+            display: flex;
+            gap: 0.75rem;
+        }}
+
+        .selected-count {{
+            font-size: 0.9rem;
+            color: var(--text-secondary);
+            font-weight: 500;
+        }}
+
+        .action-btn {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            color: white;
+            border: none;
+            padding: 0.6rem 1.2rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }}
+
+        .download-selected-btn {{
+            background-color: var(--accent-color);
+        }}
+
+        .download-selected-btn:hover {{
+            background-color: var(--accent-hover);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px var(--accent-glow);
+        }}
+
+        .delete-selected-btn {{
+            background-color: var(--danger-color);
+        }}
+
+        .delete-selected-btn:hover {{
+            background-color: var(--danger-hover);
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px var(--danger-glow);
+        }}
+
         .table-container {{
             background-color: var(--card-bg);
             border: 1px solid var(--border-color);
@@ -271,7 +338,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         .div-table-header {{
             display: grid;
-            grid-template-columns: 2fr 1.2fr 0.8fr 1.2fr 1fr;
+            grid-template-columns: 60px 2fr 1.2fr 0.8fr 1.2fr 1.8fr;
             padding: 1rem 1.5rem;
             background-color: rgba(255, 255, 255, 0.02);
             border-bottom: 1px solid var(--border-color);
@@ -280,11 +347,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: var(--text-secondary);
             text-transform: uppercase;
             letter-spacing: 0.05em;
+            align-items: center;
         }}
 
         .div-table-row {{
             display: grid;
-            grid-template-columns: 2fr 1.2fr 0.8fr 1.2fr 1fr;
+            grid-template-columns: 60px 2fr 1.2fr 0.8fr 1.2fr 1.8fr;
             padding: 1.2rem 1.5rem;
             border-bottom: 1px solid var(--border-color);
             align-items: center;
@@ -298,6 +366,50 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .div-table-row:hover {{
             background-color: var(--row-hover);
             box-shadow: inset 4px 0 0 var(--accent-color);
+        }}
+
+        .checkbox-cell {{
+            display: flex;
+            align-items: center;
+            justify-content: flex-start;
+        }}
+
+        input[type="checkbox"] {{
+            appearance: none;
+            -webkit-appearance: none;
+            width: 18px;
+            height: 18px;
+            border: 2px solid var(--border-color);
+            border-radius: 4px;
+            background-color: transparent;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            position: relative;
+        }}
+
+        input[type="checkbox"]:checked {{
+            background-color: var(--accent-color);
+            border-color: var(--accent-color);
+        }}
+
+        input[type="checkbox"]:checked::after {{
+            content: "";
+            width: 4px;
+            height: 8px;
+            border: solid white;
+            border-width: 0 2px 2px 0;
+            transform: rotate(45deg);
+            position: absolute;
+            top: 2px;
+            left: 5px;
+        }}
+
+        input[type="checkbox"]:hover {{
+            border-color: var(--accent-color);
+            box-shadow: 0 0 8px var(--accent-glow);
         }}
 
         .file-name-cell {{
@@ -338,6 +450,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         .file-action-cell {{
             display: flex;
             justify-content: flex-start;
+            gap: 0.5rem;
         }}
 
         .download-btn {{
@@ -364,6 +477,32 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             transform: translateY(0);
         }}
 
+        .delete-btn-single {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            background-color: transparent;
+            color: var(--danger-color);
+            border: 1px solid var(--danger-color);
+            padding: 0.5rem 1.2rem;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.2s ease;
+        }}
+
+        .delete-btn-single:hover {{
+            background-color: var(--danger-color);
+            color: white;
+            transform: translateY(-1px);
+            box-shadow: 0 4px 12px var(--danger-glow);
+        }}
+
+        .delete-btn-single:active {{
+            transform: translateY(0);
+        }}
+
         .empty-state {{
             padding: 5rem 2rem;
             text-align: center;
@@ -378,6 +517,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             justify-content: center;
         }}
 
+        @keyframes fadeIn {{
+            from {{ opacity: 0; transform: translateY(-5px); }}
+            to {{ opacity: 1; transform: translateY(0); }}
+        }}
+
         @media (max-width: 768px) {{
             .div-table-header {{
                 display: none;
@@ -390,8 +534,48 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             .file-action-cell {{
                 margin-top: 0.25rem;
             }}
+            .checkbox-cell {{
+                margin-bottom: 0.5rem;
+            }}
+            .actions-bar {{
+                flex-direction: column;
+                gap: 1rem;
+                align-items: flex-start;
+            }}
+            .actions-buttons {{
+                width: 100%;
+                justify-content: space-between;
+            }}
         }}
     </style>
+    <script>
+        function toggleSelectAll(master) {{
+            const checkboxes = document.querySelectorAll('input[name="files"]');
+            checkboxes.forEach(cb => {{
+                cb.checked = master.checked;
+            }});
+            updateActionsBar();
+        }}
+
+        function updateActionsBar() {{
+            const checkboxes = document.querySelectorAll('input[name="files"]');
+            const checkedCount = Array.from(checkboxes).filter(cb => cb.checked).length;
+            const actionsBar = document.getElementById('actions-bar');
+            const selectedCount = document.getElementById('selected-count');
+            const selectAll = document.getElementById('select-all');
+            
+            if (selectAll) {{
+                selectAll.checked = checkedCount === checkboxes.length && checkboxes.length > 0;
+            }}
+            
+            if (checkedCount > 0) {{
+                selectedCount.textContent = checkedCount === 1 ? '1 file selected' : `${{checkedCount}} files selected`;
+                actionsBar.classList.add('active');
+            }} else {{
+                actionsBar.classList.remove('active');
+            }}
+        }}
+    </script>
 </head>
 <body>
     <div class="container">
@@ -403,11 +587,27 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <div class="stats-badge">{total_files} Files Available</div>
         </header>
 
-        <div class="table-container">
-            <div class="div-table">
-                {table_content}
+        <form id="files-form" method="POST">
+            <div class="actions-bar" id="actions-bar">
+                <div class="selected-count" id="selected-count">0 files selected</div>
+                <div class="actions-buttons">
+                    <button type="submit" formaction="/download-selected" class="action-btn download-selected-btn">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
+                        Download Selected
+                    </button>
+                    <button type="submit" formaction="/delete-selected" class="action-btn delete-selected-btn" onclick="return confirm('Are you sure you want to delete the selected files?');">
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+                        Delete Selected
+                    </button>
+                </div>
             </div>
-        </div>
+
+            <div class="table-container">
+                <div class="div-table">
+                    {table_content}
+                </div>
+            </div>
+        </form>
     </div>
 </body>
 </html>
@@ -415,6 +615,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 HEADER_HTML = """
 <div class="div-table-header">
+    <div class="checkbox-cell">
+        <input type="checkbox" id="select-all" onclick="toggleSelectAll(this)">
+    </div>
     <div>File Name</div>
     <div>File Type</div>
     <div>Size</div>
@@ -425,6 +628,9 @@ HEADER_HTML = """
 
 ROW_HTML = """
 <div class="div-table-row">
+    <div class="checkbox-cell">
+        <input type="checkbox" name="files" value="{filename}" onclick="updateActionsBar()">
+    </div>
     <div class="file-name-cell">
         <span class="file-icon">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
@@ -439,6 +645,10 @@ ROW_HTML = """
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
             Download
         </a>
+        <button type="submit" name="delete_single" value="{filename}" formaction="/delete-single" class="delete-btn-single" onclick="return confirm('Are you sure you want to delete this file?');">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+            Delete
+        </button>
     </div>
 </div>
 """
@@ -541,6 +751,70 @@ def make_handler(output_dir):
                 except Exception:
                     pass
 
+        def delete_file(self, filename, redirect=True):
+            filename = urllib.parse.unquote(filename)
+            filename = os.path.basename(filename)
+            if not filename or filename in (".", ".."):
+                self.send_error(400, "Bad Request")
+                return
+
+            full_path = os.path.normpath(os.path.join(output_dir, filename))
+            if not full_path.startswith(os.path.abspath(output_dir)):
+                self.send_error(403, "Forbidden")
+                return
+
+            if not os.path.isfile(full_path):
+                if redirect:
+                    self.send_error(404, "File Not Found")
+                return
+
+            try:
+                os.remove(full_path)
+                logger.info(f"Deleted file: {filename}")
+                if redirect:
+                    self.send_response(303)
+                    self.send_header("Location", "/")
+                    self.end_headers()
+            except Exception as e:
+                logger.error(f"Error deleting file {filename}: {e}")
+                if redirect:
+                    self.send_error(500, "Internal Server Error")
+
+        def download_selected_zip(self, filenames):
+            if not filenames:
+                self.send_error(400, "No files selected")
+                return
+
+            zip_buffer = io.BytesIO()
+            try:
+                with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+                    for filename in filenames:
+                        filename = urllib.parse.unquote(filename)
+                        filename = os.path.basename(filename)
+                        if not filename or filename in (".", ".."):
+                            continue
+
+                        full_path = os.path.normpath(os.path.join(output_dir, filename))
+                        if not full_path.startswith(os.path.abspath(output_dir)):
+                            continue
+
+                        if os.path.isfile(full_path):
+                            zip_file.write(full_path, arcname=filename)
+
+                zip_buffer.seek(0)
+                zip_data = zip_buffer.getvalue()
+                zip_name = f"lurker_download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+
+                self.send_response(200)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
+                self.send_header("Content-Length", str(len(zip_data)))
+                self.end_headers()
+                self.wfile.write(zip_data)
+            except Exception as e:
+                logger.error(f"Error creating zip archive: {e}")
+                self.send_error(500, "Internal Server Error")
+
         def do_GET(self):
             parsed_path = urllib.parse.urlparse(self.path)
             path = parsed_path.path
@@ -550,6 +824,37 @@ def make_handler(output_dir):
             elif path.startswith("/download/"):
                 filename = path[len("/download/"):]
                 self.serve_file(filename)
+            else:
+                self.send_error(404, "File Not Found")
+
+        def do_POST(self):
+            parsed_path = urllib.parse.urlparse(self.path)
+            path = parsed_path.path
+
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length)
+            params = urllib.parse.parse_qs(post_data.decode('utf-8'))
+
+            if path == "/delete-single":
+                filename_list = params.get('delete_single', [])
+                if not filename_list:
+                    self.send_error(400, "Bad Request")
+                    return
+                filename = filename_list[0]
+                self.delete_file(filename)
+                
+            elif path == "/delete-selected":
+                filenames = params.get('files', [])
+                for filename in filenames:
+                    self.delete_file(filename, redirect=False)
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.end_headers()
+
+            elif path == "/download-selected":
+                filenames = params.get('files', [])
+                self.download_selected_zip(filenames)
+
             else:
                 self.send_error(404, "File Not Found")
 
