@@ -1,0 +1,15 @@
+services:
+  lurker:
+    build: .
+    container_name: lurker
+    ports:
+      # Map receiver and web ports dynamically using variables from .env
+      - "${LURKER_PORT:-7777}:${LURKER_PORT:-7777}"
+      - "${LURKER_WEB_PORT:-8080}:${LURKER_WEB_PORT:-8080}"
+    volumes:
+      # Mount the received data and sqlite database folders for persistence
+      - ./data:/data
+      - ./db:/app/db
+    env_file:
+      - .env
+    restart: unless-stopped

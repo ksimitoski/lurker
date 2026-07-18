@@ -1,0 +1,20 @@
+# Lurker Configuration
+# Copy this file to '.env' to use with Docker Compose
+
+# Host address to bind the servers to
+LURKER_HOST=0.0.0.0
+
+# Port for the TCP file receiver listener
+LURKER_PORT=7777
+
+# Port for the HTTP web dashboard
+LURKER_WEB_PORT=8080
+
+# Enable/disable authentication (1, true, yes to enable; 0 to disable)
+LURKER_AUTH_ENABLED=1
+
+# Directory where received files are saved (maps to /data inside container)
+LURKER_OUTPUT_DIR=/data
+
+# Path to the SQLite database inside the container
+LURKER_DB_PATH=/app/db/lurker.db
