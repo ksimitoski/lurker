@@ -21,10 +21,34 @@ Lurker is designed for quick and easy file or log exfiltration and transfers ove
 
 ## How It Works
 
+```mermaid
+flowchart TD
+    subgraph Client_Space [Client Space]
+        Client[TCP Client e.g. netcat, bash redirect]
+        User[Web Browser]
+    end
+
+    subgraph Lurker_Service [Lurker Service / Container]
+        subgraph Process [lurker_web.py Process]
+            TCPListener[TCP Listener Thread\nport 7777]
+            WebServer[Web Dashboard Server\nport 8080]
+        end
+        
+        OutputDir[(Output Directory\n/data or ./received)]
+        SQLiteDB[(SQLite Database\nlurker.db)]
+    end
+
+    Client -->|Raw TCP Connection / File Stream| TCPListener
+    TCPListener -->|Saves received files with UUID names| OutputDir
+    User -->|HTTP Requests| WebServer
+    WebServer -->|Reads / Deletes files| OutputDir
+    WebServer -->|Authenticates & Manages users| SQLiteDB
+```
+
 The project contains two main executable scripts:
 
-1. **[lurker.py](file:///home/mryuck/projects/python/lurker/lurker.py)**: The raw TCP listener. When run, it listens for incoming connections on a port (default: `7777`) and saves the exact bytes sent by clients directly into the output directory.
-2. **[lurker_web.py](file:///home/mryuck/projects/python/lurker/lurker_web.py)**: The complete package. It starts the TCP listener in a background thread and runs a concurrent web server (default: `8080`) on the main thread to serve the files dashboard.
+1. **[lurker.py](https://github.com/ksimitoski/lurker/blob/main/lurker.py)**: The raw TCP listener. When run, it listens for incoming connections on a port (default: `7777`) and saves the exact bytes sent by clients directly into the output directory.
+2. **[lurker_web.py](https://github.com/ksimitoski/lurker/blob/main/lurker_web.py)**: The complete package. It starts the TCP listener in a background thread and runs a concurrent web server (default: `8080`) on the main thread to serve the files dashboard.
 
 ---
 
