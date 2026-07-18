@@ -1,0 +1,6 @@
+**/received
+**/data
+**/__pycache__
+**/tmp_**
+**/db
+**/.env
