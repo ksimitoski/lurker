@@ -12,6 +12,8 @@ Lurker is designed for quick and easy file or log exfiltration and transfers ove
 - **Concurrent TCP File Receiver**: Listens on a custom port and handles multiple concurrent connections using multithreading.
 - **Auto-Generating Unique Names**: Automatically saves each received stream as a unique UUID file.
 - **Elegant Web Dashboard**: Built-in HTTP server serving a sleek, dark-themed dashboard to view, sort, and download received files.
+- **Role-Based Authentication**: Secure SQLite-backed user access control with distinct user roles (`admin`, `manager`, `user`).
+- **User Settings**: Integrated change-password form for all authenticated users.
 - **Docker Ready**: Includes a lightweight `Dockerfile` based on `python:3.11-slim` for easy deployments.
 - **Highly Configurable**: Customizable via standard environment variables.
 
@@ -36,6 +38,32 @@ Lurker can be customized using the following environment variables:
 | `LURKER_PORT` | Port for the TCP file receiver listener | `7777` |
 | `LURKER_WEB_PORT` | Port for the HTTP web dashboard | `8080` |
 | `LURKER_OUTPUT_DIR` | Directory where received files are saved | `./received` (or `/data` in Docker) |
+| `LURKER_AUTH_ENABLED`| Enable/disable authentication (`1`, `true`, `yes` to enable) | `0` (Disabled) |
+| `LURKER_DB_PATH` | Path to the SQLite database | `./db/lurker.db` |
+
+---
+
+## Authentication & Role-Based Access Control (RBAC)
+
+When `LURKER_AUTH_ENABLED` is active, the dashboard is protected by a login portal. 
+
+### Initial Admin Setup
+On first startup (before the SQLite database is created), Lurker automatically:
+1. Creates the SQLite database at `LURKER_DB_PATH`.
+2. Creates an initial `admin` user with a **randomly generated password**.
+3. Prints the generated username and password to the console (standard output).
+
+*Make sure to copy the printed credentials on first execution to gain initial access.*
+
+### User Roles
+Lurker supports three roles with distinct permissions:
+- **`user`**: Read-only access. Can view the list of files and download individual files or a ZIP of selected files.
+- **`manager`**: Read and Delete access. Can view, download, and delete files (individually or in bulk).
+- **`admin`**: Full access. Has all manager privileges plus access to the **Admin Dashboard** to add or remove users, and assign them roles.
+
+### User Management & Settings
+- **Admin Dashboard**: Accessible by the `admin` user at `/admin`. Admins can view the user list, add new users (with roles), and remove users (preventing deletion of the last admin).
+- **Change Password**: Any logged-in user can change their password at `/change-password` by providing their current password and their new password.
 
 ---
 
@@ -63,12 +91,14 @@ python lurker.py
    ```
 
 2. **Run the Container**:
-   Make sure to map the TCP listener and Web Dashboard ports, and mount a volume for persisting files:
+   Make sure to map the TCP listener and Web Dashboard ports, and mount volumes for persisting files and the database:
    ```bash
    docker run -d \
      -p 7777:7777 \
      -p 8080:8080 \
      -v $(pwd)/received:/data \
+     -v $(pwd)/db:/app/db \
+     -e LURKER_AUTH_ENABLED=1 \
      --name lurker \
      lurker
    ```
@@ -130,4 +160,5 @@ The web dashboard displays:
 - File Type (automatically detected using magic bytes and heuristics).
 - File size (automatically formatted as KB, MB, etc.).
 - File upload/modification timestamp.
-- Download buttons for each file.
+- Download / Delete buttons (depending on the user's role).
+- Navigation links for the Admin Dashboard and Changing Passwords (if authentication is enabled).

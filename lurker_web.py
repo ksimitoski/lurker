@@ -8,7 +8,11 @@ import zipfile
 import io
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import urllib.parse
-from datetime import datetime
+from datetime import datetime, timedelta
+import sqlite3
+import hashlib
+import secrets
+from http import cookies
 
 # Configure logging to stdout
 logging.basicConfig(
@@ -20,8 +24,153 @@ logging.basicConfig(
 )
 logger = logging.getLogger("lurker-web")
 
+# --- Database & Auth Functions ---
+
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = secrets.token_hex(16)
+    hashed = hashlib.sha256((password + salt).encode('utf-8')).hexdigest()
+    return hashed, salt
+
+def init_db(db_path):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            username TEXT PRIMARY KEY,
+            password_hash TEXT,
+            salt TEXT,
+            role TEXT
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sessions (
+            session_id TEXT PRIMARY KEY,
+            username TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Check if we need to create admin
+    c.execute("SELECT count(*) FROM users")
+    count = c.fetchone()[0]
+    if count == 0:
+        admin_pass = secrets.token_urlsafe(12)
+        hashed, salt = hash_password(admin_pass)
+        c.execute("INSERT INTO users (username, password_hash, salt, role) VALUES (?, ?, ?, ?)", 
+                  ('admin', hashed, salt, 'admin'))
+        logger.info("*" * 50)
+        logger.info("INITIAL SETUP: Admin user created.")
+        logger.info(f"Username: admin")
+        logger.info(f"Password: {admin_pass}")
+        logger.info("Please copy these credentials now. They will not be shown again.")
+        logger.info("*" * 50)
+    
+    conn.commit()
+    conn.close()
+
+def verify_user(db_path, username, password):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT password_hash, salt FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        stored_hash, salt = row
+        hashed, _ = hash_password(password, salt)
+        if hashed == stored_hash:
+            return True
+    return False
+
+def create_session(db_path, username):
+    session_id = secrets.token_hex(32)
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("INSERT INTO sessions (session_id, username) VALUES (?, ?)", (session_id, username))
+    conn.commit()
+    conn.close()
+    return session_id
+
+def get_session_user_role(db_path, session_id):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("""
+        SELECT u.username, u.role
+        FROM sessions s
+        JOIN users u ON s.username = u.username
+        WHERE s.session_id = ?
+    """, (session_id,))
+    row = c.fetchone()
+    conn.close()
+    if row:
+        return row[0], row[1]
+    return None, None
+
+def delete_session(db_path, session_id):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+    conn.commit()
+    conn.close()
+
+def add_user(db_path, username, password, role):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    try:
+        hashed, salt = hash_password(password)
+        c.execute("INSERT INTO users (username, password_hash, salt, role) VALUES (?, ?, ?, ?)", 
+                  (username, hashed, salt, role))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+def delete_user(db_path, username):
+    # Prevent deleting the last admin
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    
+    c.execute("SELECT role FROM users WHERE username = ?", (username,))
+    row = c.fetchone()
+    if not row:
+        conn.close()
+        return False
+        
+    role = row[0]
+    if role == 'admin':
+        c.execute("SELECT count(*) FROM users WHERE role = 'admin'")
+        admin_count = c.fetchone()[0]
+        if admin_count <= 1:
+            conn.close()
+            return False # Cannot delete last admin
+            
+    c.execute("DELETE FROM users WHERE username = ?", (username,))
+    c.execute("DELETE FROM sessions WHERE username = ?", (username,))
+    conn.commit()
+    conn.close()
+    return True
+
+def get_all_users(db_path):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    c.execute("SELECT username, role FROM users")
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def update_user_password(db_path, username, new_password):
+    conn = sqlite3.connect(db_path)
+    c = conn.cursor()
+    hashed, salt = hash_password(new_password)
+    c.execute("UPDATE users SET password_hash = ?, salt = ? WHERE username = ?", (hashed, salt, username))
+    conn.commit()
+    conn.close()
+    return True
+
+# --- Helpers ---
 def format_size(size_bytes):
-    """Formats bytes to a human-readable string."""
     if size_bytes == 0:
         return "0 Bytes"
     units = ["Bytes", "KB", "MB", "GB", "TB"]
@@ -32,123 +181,71 @@ def format_size(size_bytes):
     return f"{size_bytes:.2f} {units[i]}"
 
 def detect_file_type(file_path):
-    """Detects the file type of a file without extension by reading magic bytes and using heuristics."""
     try:
         with open(file_path, "rb") as f:
             header = f.read(512)
     except Exception:
         return "Unknown"
-
     if not header:
         return "Empty File"
-
-    # Check common magic bytes/signatures
-    if header.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "PNG Image"
-    if header.startswith(b"\xff\xd8\xff"):
-        return "JPEG Image"
-    if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"):
-        return "GIF Image"
-    if header.startswith(b"%PDF-"):
-        return "PDF Document"
-    if header.startswith(b"PK\x03\x04"):
-        return "ZIP Archive"
-    if header.startswith(b"\x1f\x8b"):
-        return "GZIP Archive"
-    if header.startswith(b"\x7fELF"):
-        return "ELF Executable"
-    if header.startswith(b"MZ"):
-        return "Windows Executable"
-    if header.startswith(b"BM"):
-        return "BMP Image"
-    if header.startswith(b"ID3") or header.startswith(b"\xff\xfb") or header.startswith(b"\xff\xf3") or header.startswith(b"\xff\xf2"):
-        return "MP3 Audio"
-    if len(header) >= 12 and header[4:8] == b"ftyp":
-        return "MP4 Video"
-    if header.startswith(b"OggS"):
-        return "Ogg Media"
-    if header.startswith(b"\x1a\x45\xdf\xa3"):
-        return "MKV/WebM Video"
-    if header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WAVE":
-        return "WAV Audio"
-
-    # Check text-based files
+    if header.startswith(b"\x89PNG\r\n\x1a\n"): return "PNG Image"
+    if header.startswith(b"\xff\xd8\xff"): return "JPEG Image"
+    if header.startswith(b"GIF87a") or header.startswith(b"GIF89a"): return "GIF Image"
+    if header.startswith(b"%PDF-"): return "PDF Document"
+    if header.startswith(b"PK\x03\x04"): return "ZIP Archive"
+    if header.startswith(b"\x1f\x8b"): return "GZIP Archive"
+    if header.startswith(b"\x7fELF"): return "ELF Executable"
+    if header.startswith(b"MZ"): return "Windows Executable"
+    if header.startswith(b"BM"): return "BMP Image"
+    if header.startswith(b"ID3") or header.startswith(b"\xff\xfb") or header.startswith(b"\xff\xf3") or header.startswith(b"\xff\xf2"): return "MP3 Audio"
+    if len(header) >= 12 and header[4:8] == b"ftyp": return "MP4 Video"
+    if header.startswith(b"OggS"): return "Ogg Media"
+    if header.startswith(b"\x1a\x45\xdf\xa3"): return "MKV/WebM Video"
+    if header.startswith(b"RIFF") and len(header) >= 12 and header[8:12] == b"WAVE": return "WAV Audio"
     try:
         text = header.decode("utf-8", errors="strict")
         stripped = text.strip()
-        if stripped.lower().startswith("<!doctype html") or stripped.lower().startswith("<html"):
-            return "HTML Document"
-        if stripped.lower().startswith("<?xml"):
-            return "XML Document"
-        
-        # Check executable scripts starting with shebang
+        if stripped.lower().startswith("<!doctype html") or stripped.lower().startswith("<html"): return "HTML Document"
+        if stripped.lower().startswith("<?xml"): return "XML Document"
         if stripped.startswith("#!"):
             line = stripped.split("\n", 1)[0]
-            if "python" in line:
-                return "Python Script"
-            if "bash" in line or "sh" in line:
-                return "Shell Script"
+            if "python" in line: return "Python Script"
+            if "bash" in line or "sh" in line: return "Shell Script"
             return "Executable Script"
-
-        # Check for JSON syntax in the header or attempt parsing full file if small
         if stripped.startswith("{") or stripped.startswith("["):
             import json
             try:
-                # Try parsing header string as JSON (might succeed if small JSON)
                 json.loads(text)
                 return "JSON Document"
             except Exception:
-                # If it's a small file (< 64KB), we can parse the whole file to confirm JSON
                 try:
                     file_size = os.path.getsize(file_path)
                     if file_size < 65536:
                         with open(file_path, "r", encoding="utf-8") as f_text:
                             json.load(f_text)
                         return "JSON Document"
-                except Exception:
-                    pass
-
-        # Ensure text is printable
-        non_printable = 0
-        for char in text:
-            o = ord(char)
-            # Allow common control characters: tab, newline, carriage return
-            if o < 32 and o not in (9, 10, 13):
-                non_printable += 1
-        if non_printable == 0:
-            return "Plain Text"
+                except Exception: pass
+        non_printable = sum(1 for char in text if ord(char) < 32 and ord(char) not in (9, 10, 13))
+        if non_printable == 0: return "Plain Text"
     except UnicodeDecodeError:
         pass
-
     return "Binary Data"
 
 def handle_client(client_socket, client_address, output_dir):
     logger.info(f"Connection accepted from {client_address}")
-
-    # Generate a random UUID for the filename
     file_uuid = str(uuid.uuid4())
-
-    # Check if path already exists
     while os.path.isfile(os.path.join(output_dir, file_uuid)):
         file_uuid = str(uuid.uuid4())
-
-    # Set final file path
     file_path = os.path.join(output_dir, file_uuid)
-
-    # Receive file chunk by chunk
     try:
         with open(file_path, "wb") as f:
             while True:
                 data = client_socket.recv(4096)
-                if not data:
-                    # EOF
-                    break
+                if not data: break
                 f.write(data)
-        
         logger.info(f"File transfer complete. Saved to {file_path}")
     except Exception as e:
         logger.error(f"Error during file transfer from {client_address}: {e}")
-        # Clean up the file if it was partially written
         if os.path.exists(file_path):
             try:
                 os.remove(file_path)
@@ -160,10 +257,8 @@ def handle_client(client_socket, client_address, output_dir):
         logger.info(f"Client connection closed for {client_address}.")
 
 def run_tcp_server(host, port, output_dir):
-    # Set up TCP socket
     server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
     try:
         server_socket.bind((host, port))
         server_socket.listen()
@@ -171,7 +266,6 @@ def run_tcp_server(host, port, output_dir):
     except Exception as e:
         logger.error(f"Failed to bind TCP server to {host}:{port}: {e}")
         return
-
     try:
         while True:
             client_socket, client_address = server_socket.accept()
@@ -187,18 +281,9 @@ def run_tcp_server(host, port, output_dir):
         server_socket.close()
         logger.info("TCP server socket closed.")
 
-# HTML/CSS Templates
-HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Lurker - File Dashboard</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
-    <style>
-        :root {{
+# --- HTML Templates ---
+BASE_CSS = """
+        :root {
             --bg-color: #0b0f19;
             --card-bg: #111827;
             --border-color: #1f2937;
@@ -211,9 +296,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             --danger-hover: #dc2626;
             --danger-glow: rgba(239, 68, 68, 0.15);
             --row-hover: #1f2937;
-        }}
-
-        body {{
+        }
+        body {
             background-color: var(--bg-color);
             color: var(--text-primary);
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
@@ -223,22 +307,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             justify-content: center;
             align-items: flex-start;
             min-height: 100vh;
-        }}
-
-        .container {{
+        }
+        .container {
             width: 100%;
             max-width: 1000px;
             margin: 0 auto;
-        }}
-
-        header {{
+        }
+        header {
             margin-bottom: 2rem;
             display: flex;
             justify-content: space-between;
             align-items: center;
-        }}
-
-        h1 {{
+        }
+        h1 {
             font-size: 1.8rem;
             font-weight: 700;
             margin: 0;
@@ -248,8 +329,230 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             display: flex;
             align-items: center;
             gap: 0.75rem;
-        }}
+        }
+        .header-actions {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+        }
+        .btn-link {
+            color: var(--text-secondary);
+            text-decoration: none;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: color 0.2s;
+        }
+        .btn-link:hover { color: var(--text-primary); }
+        
+        .form-container {
+            background-color: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 2rem;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+            max-width: 400px;
+            margin: 4rem auto;
+        }
+        .form-group {
+            margin-bottom: 1.5rem;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+        .form-group input, .form-group select {
+            width: 100%;
+            padding: 0.75rem;
+            background-color: var(--bg-color);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-primary);
+            font-family: inherit;
+            box-sizing: border-box;
+        }
+        .form-group input:focus, .form-group select:focus {
+            outline: none;
+            border-color: var(--accent-color);
+            box-shadow: 0 0 0 2px var(--accent-glow);
+        }
+        .btn-primary {
+            width: 100%;
+            padding: 0.75rem;
+            background-color: var(--accent-color);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .btn-primary:hover {
+            background-color: var(--accent-hover);
+            box-shadow: 0 4px 12px var(--accent-glow);
+        }
+        .error-msg {
+            color: var(--danger-color);
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+            text-align: center;
+        }
+"""
 
+LOGIN_HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lurker - Login</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>{BASE_CSS}</style>
+</head>
+<body>
+    <div class="form-container">
+        <h1 style="margin-bottom: 1.5rem; justify-content: center;">
+            <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            Lurker Login
+        </h1>
+        {{error_html}}
+        <form method="POST" action="/login">
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" name="username" required>
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" name="password" required>
+            </div>
+            <button type="submit" class="btn-primary">Login</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+ADMIN_HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lurker - Admin</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        {BASE_CSS}
+        .admin-layout {{ display: flex; gap: 2rem; align-items: flex-start; flex-wrap: wrap; }}
+        .users-list {{ flex: 2; min-width: 300px; background-color: var(--card-bg); border: 1px solid var(--border-color); border-radius: 12px; padding: 1.5rem; }}
+        .add-user-form {{ flex: 1; min-width: 250px; background-color: var(--card-bg); border: 1px solid var(--border-color); border-radius: 12px; padding: 1.5rem; }}
+        .user-row {{ display: flex; justify-content: space-between; align-items: center; padding: 1rem 0; border-bottom: 1px solid var(--border-color); }}
+        .user-row:last-child {{ border-bottom: none; }}
+        .user-info {{ display: flex; gap: 1rem; align-items: center; }}
+        .role-badge {{ padding: 0.25rem 0.5rem; border-radius: 4px; font-size: 0.75rem; font-weight: 600; text-transform: uppercase; }}
+        .role-admin {{ background-color: rgba(239, 68, 68, 0.2); color: #ef4444; }}
+        .role-manager {{ background-color: rgba(245, 158, 11, 0.2); color: #f59e0b; }}
+        .role-user {{ background-color: rgba(59, 130, 246, 0.2); color: #3b82f6; }}
+        .btn-danger {{ background-color: transparent; border: 1px solid var(--danger-color); color: var(--danger-color); padding: 0.4rem 0.8rem; border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 0.85rem; font-weight: 500; transition: all 0.2s; }}
+        .btn-danger:hover {{ background-color: var(--danger-color); color: white; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>
+                <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+                Lurker Admin
+            </h1>
+            <div class="header-actions">
+                <a href="/" class="btn-link">Dashboard</a>
+                <a href="/change-password" class="btn-link">Change Password</a>
+                <a href="/logout" class="btn-link">Logout</a>
+            </div>
+        </header>
+        
+        {{error_html}}
+
+        <div class="admin-layout">
+            <div class="users-list">
+                <h2 style="margin-top:0;">Users</h2>
+                {{users_html}}
+            </div>
+            
+            <div class="add-user-form">
+                <h2 style="margin-top:0;">Add User</h2>
+                <form method="POST" action="/admin/add_user">
+                    <div class="form-group">
+                        <label>Username</label>
+                        <input type="text" name="username" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" name="password" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Role</label>
+                        <select name="role" required>
+                            <option value="user">User (Download only)</option>
+                            <option value="manager">Manager (Download + Delete)</option>
+                            <option value="admin">Admin (Full Access)</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="btn-primary">Add User</button>
+                </form>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+CHANGE_PASSWORD_HTML = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lurker - Change Password</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>{BASE_CSS}</style>
+</head>
+<body>
+    <div class="form-container">
+        <h1 style="margin-bottom: 1.5rem; justify-content: center;">
+            Change Password
+        </h1>
+        {{error_html}}
+        <form method="POST" action="/change-password">
+            <div class="form-group">
+                <label>Current Password</label>
+                <input type="password" name="current_password" required>
+            </div>
+            <div class="form-group">
+                <label>New Password</label>
+                <input type="password" name="new_password" required>
+            </div>
+            <div class="form-group">
+                <label>Confirm New Password</label>
+                <input type="password" name="confirm_password" required>
+            </div>
+            <button type="submit" class="btn-primary">Change Password</button>
+            <div style="margin-top: 1rem; text-align: center;">
+                <a href="/" class="btn-link">Back to Dashboard</a>
+            </div>
+        </form>
+    </div>
+</body>
+</html>
+""".replace("{BASE_CSS}", BASE_CSS)
+
+HTML_TEMPLATE = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lurker - File Dashboard</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        {BASE_CSS}
         .stats-badge {{
             background-color: var(--card-bg);
             border: 1px solid var(--border-color);
@@ -259,7 +562,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             color: var(--text-secondary);
             font-weight: 500;
         }}
-
         .actions-bar {{
             display: none;
             align-items: center;
@@ -271,23 +573,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             margin-bottom: 1.5rem;
             box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
         }}
-
-        .actions-bar.active {{
-            display: flex;
-            animation: fadeIn 0.2s ease;
-        }}
-
-        .actions-buttons {{
-            display: flex;
-            gap: 0.75rem;
-        }}
-
-        .selected-count {{
-            font-size: 0.9rem;
-            color: var(--text-secondary);
-            font-weight: 500;
-        }}
-
+        .actions-bar.active {{ display: flex; }}
+        .actions-buttons {{ display: flex; gap: 0.75rem; }}
         .action-btn {{
             display: inline-flex;
             align-items: center;
@@ -301,27 +588,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             cursor: pointer;
             transition: all 0.2s ease;
         }}
-
-        .download-selected-btn {{
-            background-color: var(--accent-color);
-        }}
-
-        .download-selected-btn:hover {{
-            background-color: var(--accent-hover);
-            transform: translateY(-1px);
-            box-shadow: 0 4px 12px var(--accent-glow);
-        }}
-
-        .delete-selected-btn {{
-            background-color: var(--danger-color);
-        }}
-
-        .delete-selected-btn:hover {{
-            background-color: var(--danger-hover);
-            transform: translateY(-1px);
-            box-shadow: 0 4px 12px var(--danger-glow);
-        }}
-
+        .download-selected-btn {{ background-color: var(--accent-color); }}
+        .download-selected-btn:hover {{ background-color: var(--accent-hover); }}
+        .delete-selected-btn {{ background-color: var(--danger-color); }}
+        .delete-selected-btn:hover {{ background-color: var(--danger-hover); }}
         .table-container {{
             background-color: var(--card-bg);
             border: 1px solid var(--border-color);
@@ -329,245 +599,69 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             overflow: hidden;
             box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
         }}
-
-        .div-table {{
-            display: flex;
-            flex-direction: column;
-            width: 100%;
-        }}
-
-        .div-table-header {{
+        .div-table {{ display: flex; flex-direction: column; width: 100%; }}
+        .div-table-header, .div-table-row {{
             display: grid;
             grid-template-columns: 60px 2fr 1.2fr 0.8fr 1.2fr 1.8fr;
             padding: 1rem 1.5rem;
-            background-color: rgba(255, 255, 255, 0.02);
             border-bottom: 1px solid var(--border-color);
+            align-items: center;
+        }}
+        .div-table-header {{
+            background-color: rgba(255, 255, 255, 0.02);
             font-weight: 600;
             font-size: 0.85rem;
             color: var(--text-secondary);
             text-transform: uppercase;
-            letter-spacing: 0.05em;
-            align-items: center;
         }}
-
-        .div-table-row {{
-            display: grid;
-            grid-template-columns: 60px 2fr 1.2fr 0.8fr 1.2fr 1.8fr;
-            padding: 1.2rem 1.5rem;
-            border-bottom: 1px solid var(--border-color);
-            align-items: center;
-            transition: all 0.2s ease;
-        }}
-
-        .div-table-row:last-child {{
-            border-bottom: none;
-        }}
-
-        .div-table-row:hover {{
-            background-color: var(--row-hover);
-            box-shadow: inset 4px 0 0 var(--accent-color);
-        }}
-
-        .checkbox-cell {{
-            display: flex;
-            align-items: center;
-            justify-content: flex-start;
-        }}
-
+        .div-table-row:hover {{ background-color: var(--row-hover); }}
         input[type="checkbox"] {{
-            appearance: none;
-            -webkit-appearance: none;
-            width: 18px;
-            height: 18px;
-            border: 2px solid var(--border-color);
-            border-radius: 4px;
-            background-color: transparent;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            cursor: pointer;
-            transition: all 0.2s ease;
-            position: relative;
+            appearance: none; -webkit-appearance: none;
+            width: 18px; height: 18px; border: 2px solid var(--border-color); border-radius: 4px;
+            cursor: pointer; position: relative;
         }}
-
-        input[type="checkbox"]:checked {{
-            background-color: var(--accent-color);
-            border-color: var(--accent-color);
-        }}
-
+        input[type="checkbox"]:checked {{ background-color: var(--accent-color); border-color: var(--accent-color); }}
         input[type="checkbox"]:checked::after {{
-            content: "";
-            width: 4px;
-            height: 8px;
-            border: solid white;
-            border-width: 0 2px 2px 0;
-            transform: rotate(45deg);
-            position: absolute;
-            top: 2px;
-            left: 5px;
+            content: ""; width: 4px; height: 8px; border: solid white; border-width: 0 2px 2px 0;
+            transform: rotate(45deg); position: absolute; top: 2px; left: 5px;
         }}
-
-        input[type="checkbox"]:hover {{
-            border-color: var(--accent-color);
-            box-shadow: 0 0 8px var(--accent-glow);
-        }}
-
-        .file-name-cell {{
-            display: flex;
-            align-items: center;
-            gap: 0.75rem;
-            font-weight: 500;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            white-space: nowrap;
-            min-width: 0;
-        }}
-
-        .file-icon {{
-            color: var(--accent-color);
-            flex-shrink: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-        }}
-
-        .file-type-cell {{
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-            font-weight: 500;
-        }}
-
-        .file-size-cell {{
-            color: var(--text-primary);
-            font-size: 0.9rem;
-        }}
-
-        .file-time-cell {{
-            color: var(--text-secondary);
-            font-size: 0.9rem;
-        }}
-
-        .file-action-cell {{
-            display: flex;
-            justify-content: flex-start;
-            gap: 0.5rem;
-        }}
-
+        .file-name-cell {{ display: flex; align-items: center; gap: 0.75rem; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+        .file-icon {{ color: var(--accent-color); flex-shrink: 0; }}
+        .file-type-cell {{ color: var(--text-secondary); font-size: 0.9rem; font-weight: 500; }}
+        .file-size-cell {{ color: var(--text-primary); font-size: 0.9rem; }}
+        .file-time-cell {{ color: var(--text-secondary); font-size: 0.9rem; }}
+        .file-action-cell {{ display: flex; justify-content: flex-start; gap: 0.5rem; }}
         .download-btn {{
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            background-color: var(--accent-color);
-            color: white;
-            text-decoration: none;
-            padding: 0.5rem 1.2rem;
-            border-radius: 6px;
-            font-size: 0.85rem;
-            font-weight: 500;
-            transition: all 0.2s ease;
+            display: inline-flex; align-items: center; gap: 0.5rem;
+            background-color: var(--accent-color); color: white; text-decoration: none;
+            padding: 0.5rem 1.2rem; border-radius: 6px; font-size: 0.85rem; font-weight: 500;
         }}
-
-        .download-btn:hover {{
-            background-color: var(--accent-hover);
-            transform: translateY(-1px);
-            box-shadow: 0 4px 12px var(--accent-glow);
-        }}
-
-        .download-btn:active {{
-            transform: translateY(0);
-        }}
-
+        .download-btn:hover {{ background-color: var(--accent-hover); }}
         .delete-btn-single {{
-            display: inline-flex;
-            align-items: center;
-            gap: 0.5rem;
-            background-color: transparent;
-            color: var(--danger-color);
-            border: 1px solid var(--danger-color);
-            padding: 0.5rem 1.2rem;
-            border-radius: 6px;
-            font-size: 0.85rem;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.2s ease;
+            display: inline-flex; align-items: center; gap: 0.5rem;
+            background-color: transparent; color: var(--danger-color); border: 1px solid var(--danger-color);
+            padding: 0.5rem 1.2rem; border-radius: 6px; font-size: 0.85rem; font-weight: 500; cursor: pointer;
         }}
-
-        .delete-btn-single:hover {{
-            background-color: var(--danger-color);
-            color: white;
-            transform: translateY(-1px);
-            box-shadow: 0 4px 12px var(--danger-glow);
-        }}
-
-        .delete-btn-single:active {{
-            transform: translateY(0);
-        }}
-
-        .empty-state {{
-            padding: 5rem 2rem;
-            text-align: center;
-            color: var(--text-secondary);
-        }}
-
-        .empty-icon {{
-            font-size: 3rem;
-            margin-bottom: 1.2rem;
-            color: var(--border-color);
-            display: flex;
-            justify-content: center;
-        }}
-
-        @keyframes fadeIn {{
-            from {{ opacity: 0; transform: translateY(-5px); }}
-            to {{ opacity: 1; transform: translateY(0); }}
-        }}
-
+        .delete-btn-single:hover {{ background-color: var(--danger-color); color: white; }}
+        .empty-state {{ padding: 5rem 2rem; text-align: center; color: var(--text-secondary); }}
+        .empty-icon {{ font-size: 3rem; margin-bottom: 1.2rem; color: var(--border-color); display: flex; justify-content: center; }}
         @media (max-width: 768px) {{
-            .div-table-header {{
-                display: none;
-            }}
-            .div-table-row {{
-                grid-template-columns: 1fr;
-                gap: 0.75rem;
-                padding: 1.2rem;
-            }}
-            .file-action-cell {{
-                margin-top: 0.25rem;
-            }}
-            .checkbox-cell {{
-                margin-bottom: 0.5rem;
-            }}
-            .actions-bar {{
-                flex-direction: column;
-                gap: 1rem;
-                align-items: flex-start;
-            }}
-            .actions-buttons {{
-                width: 100%;
-                justify-content: space-between;
-            }}
+            .div-table-header {{ display: none; }}
+            .div-table-row {{ grid-template-columns: 1fr; gap: 0.75rem; padding: 1.2rem; }}
         }}
     </style>
     <script>
         function toggleSelectAll(master) {{
             const checkboxes = document.querySelectorAll('input[name="files"]');
-            checkboxes.forEach(cb => {{
-                cb.checked = master.checked;
-            }});
+            checkboxes.forEach(cb => cb.checked = master.checked);
             updateActionsBar();
         }}
-
         function updateActionsBar() {{
             const checkboxes = document.querySelectorAll('input[name="files"]');
             const checkedCount = Array.from(checkboxes).filter(cb => cb.checked).length;
             const actionsBar = document.getElementById('actions-bar');
             const selectedCount = document.getElementById('selected-count');
-            const selectAll = document.getElementById('select-all');
-            
-            if (selectAll) {{
-                selectAll.checked = checkedCount === checkboxes.length && checkboxes.length > 0;
-            }}
-            
+            if(document.getElementById('select-all')) document.getElementById('select-all').checked = checkedCount === checkboxes.length && checkboxes.length > 0;
             if (checkedCount > 0) {{
                 selectedCount.textContent = checkedCount === 1 ? '1 file selected' : `${{checkedCount}} files selected`;
                 actionsBar.classList.add('active');
@@ -584,7 +678,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
                 Lurker Dashboard
             </h1>
-            <div class="stats-badge">{total_files} Files Available</div>
+            <div class="header-actions">
+                <div class="stats-badge">{{total_files}} Files</div>
+                {{header_links}}
+            </div>
         </header>
 
         <form id="files-form" method="POST">
@@ -592,19 +689,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <div class="selected-count" id="selected-count">0 files selected</div>
                 <div class="actions-buttons">
                     <button type="submit" formaction="/download-selected" class="action-btn download-selected-btn">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
                         Download Selected
                     </button>
-                    <button type="submit" formaction="/delete-selected" class="action-btn delete-selected-btn" onclick="return confirm('Are you sure you want to delete the selected files?');">
-                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-                        Delete Selected
-                    </button>
+                    {{delete_selected_btn}}
                 </div>
             </div>
 
             <div class="table-container">
                 <div class="div-table">
-                    {table_content}
+                    {{table_content}}
                 </div>
             </div>
         </form>
@@ -626,7 +719,7 @@ HEADER_HTML = """
 </div>
 """
 
-ROW_HTML = """
+ROW_HTML_TEMPLATE = """
 <div class="div-table-row">
     <div class="checkbox-cell">
         <input type="checkbox" name="files" value="{filename}" onclick="updateActionsBar()">
@@ -642,13 +735,9 @@ ROW_HTML = """
     <div class="file-time-cell">{time}</div>
     <div class="file-action-cell">
         <a href="/download/{filename}" class="download-btn">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
             Download
         </a>
-        <button type="submit" name="delete_single" value="{filename}" formaction="/delete-single" class="delete-btn-single" onclick="return confirm('Are you sure you want to delete this file?');">
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-            Delete
-        </button>
+        {delete_btn}
     </div>
 </div>
 """
@@ -662,14 +751,46 @@ EMPTY_HTML = """
 </div>
 """
 
-def make_handler(output_dir):
+def make_handler(output_dir, auth_enabled, db_path):
     class LurkerWebHandler(BaseHTTPRequestHandler):
         def log_message(self, format, *args):
             logger.info("%s - %s" % (self.address_string(), format % args))
+            
+        def get_current_user(self):
+            if not auth_enabled:
+                return 'admin', 'admin'
+                
+            if "Cookie" in self.headers:
+                cookie = cookies.SimpleCookie(self.headers["Cookie"])
+                if "session_id" in cookie:
+                    session_id = cookie["session_id"].value
+                    username, role = get_session_user_role(db_path, session_id)
+                    if username:
+                        return username, role
+            return None, None
+            
+        def require_auth(self, allowed_roles=None):
+            username, role = self.get_current_user()
+            if not username:
+                self.send_response(303)
+                self.send_header("Location", "/login")
+                self.end_headers()
+                return False
+                
+            if allowed_roles and role not in allowed_roles:
+                self.send_error(403, "Forbidden")
+                return False
+                
+            return True
 
         def serve_dashboard(self):
+            if not self.require_auth():
+                return
+                
+            username, role = self.get_current_user()
+            can_delete = role in ('admin', 'manager')
+            
             try:
-                # Read all files in the output directory
                 files = []
                 if os.path.exists(output_dir):
                     for name in os.listdir(output_dir):
@@ -684,8 +805,6 @@ def make_handler(output_dir):
                                 'mtime': stat.st_mtime,
                                 'time': datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
                             })
-                
-                # Sort files by modification time descending (newest first)
                 files.sort(key=lambda x: x['mtime'], reverse=True)
 
                 if not files:
@@ -694,13 +813,20 @@ def make_handler(output_dir):
                     rows = [HEADER_HTML]
                     for f in files:
                         display_name = f['name'].split('-')[-1]
-                        rows.append(ROW_HTML.format(display_name=display_name, filename=f['name'], type=f['type'], size=f['size'], time=f['time']))
+                        delete_btn = f'<button type="submit" name="delete_single" value="{f["name"]}" formaction="/delete-single" class="delete-btn-single" onclick="return confirm(\'Are you sure you want to delete this file?\');">Delete</button>' if can_delete else ""
+                        rows.append(ROW_HTML_TEMPLATE.replace("{display_name}", display_name).replace("{filename}", f['name']).replace("{type}", f['type']).replace("{size}", f['size']).replace("{time}", f['time']).replace("{delete_btn}", delete_btn))
                     table_content = "\n".join(rows)
 
-                html = HTML_TEMPLATE.format(
-                    total_files=len(files),
-                    table_content=table_content
-                )
+                header_links = ""
+                if auth_enabled:
+                    header_links += '<a href="/change-password" class="btn-link">Change Password</a> '
+                    if role == 'admin':
+                        header_links += '<a href="/admin" class="btn-link">Admin Dashboard</a> '
+                    header_links += '<a href="/logout" class="btn-link">Logout</a>'
+
+                delete_selected_btn = '<button type="submit" formaction="/delete-selected" class="action-btn delete-selected-btn" onclick="return confirm(\'Are you sure you want to delete the selected files?\');">Delete Selected</button>' if can_delete else ""
+
+                html = HTML_TEMPLATE.replace("{total_files}", str(len(files))).replace("{table_content}", table_content).replace("{header_links}", header_links).replace("{delete_selected_btn}", delete_selected_btn)
 
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -712,24 +838,21 @@ def make_handler(output_dir):
                 self.send_error(500, "Internal Server Error")
 
         def serve_file(self, filename):
-            # Unquote filename to handle URL-encoded paths
+            if not self.require_auth(['admin', 'manager', 'user']):
+                return
+                
             filename = urllib.parse.unquote(filename)
-            # Clean filename to prevent directory traversal
             filename = os.path.basename(filename)
             if not filename or filename == "." or filename == "..":
                 self.send_error(400, "Bad Request")
                 return
-
             full_path = os.path.normpath(os.path.join(output_dir, filename))
-            # Verify the path is inside output_dir
             if not full_path.startswith(os.path.abspath(output_dir)):
                 self.send_error(403, "Forbidden")
                 return
-
             if not os.path.isfile(full_path):
                 self.send_error(404, "File Not Found")
                 return
-
             try:
                 file_size = os.path.getsize(full_path)
                 self.send_response(200)
@@ -737,37 +860,31 @@ def make_handler(output_dir):
                 self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
                 self.send_header("Content-Length", str(file_size))
                 self.end_headers()
-
                 with open(full_path, "rb") as f:
                     while True:
                         chunk = f.read(4096)
-                        if not chunk:
-                            break
+                        if not chunk: break
                         self.wfile.write(chunk)
             except Exception as e:
                 logger.error(f"Error sending file {filename}: {e}")
-                try:
-                    self.send_error(500, "Internal Server Error")
-                except Exception:
-                    pass
+                self.send_error(500, "Internal Server Error")
 
         def delete_file(self, filename, redirect=True):
+            if not self.require_auth(['admin', 'manager']):
+                return
+                
             filename = urllib.parse.unquote(filename)
             filename = os.path.basename(filename)
             if not filename or filename in (".", ".."):
                 self.send_error(400, "Bad Request")
                 return
-
             full_path = os.path.normpath(os.path.join(output_dir, filename))
             if not full_path.startswith(os.path.abspath(output_dir)):
                 self.send_error(403, "Forbidden")
                 return
-
             if not os.path.isfile(full_path):
-                if redirect:
-                    self.send_error(404, "File Not Found")
+                if redirect: self.send_error(404, "File Not Found")
                 return
-
             try:
                 os.remove(full_path)
                 logger.info(f"Deleted file: {filename}")
@@ -777,34 +894,29 @@ def make_handler(output_dir):
                     self.end_headers()
             except Exception as e:
                 logger.error(f"Error deleting file {filename}: {e}")
-                if redirect:
-                    self.send_error(500, "Internal Server Error")
+                if redirect: self.send_error(500, "Internal Server Error")
 
         def download_selected_zip(self, filenames):
+            if not self.require_auth(['admin', 'manager', 'user']):
+                return
+                
             if not filenames:
                 self.send_error(400, "No files selected")
                 return
-
             zip_buffer = io.BytesIO()
             try:
                 with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
                     for filename in filenames:
                         filename = urllib.parse.unquote(filename)
                         filename = os.path.basename(filename)
-                        if not filename or filename in (".", ".."):
-                            continue
-
+                        if not filename or filename in (".", ".."): continue
                         full_path = os.path.normpath(os.path.join(output_dir, filename))
-                        if not full_path.startswith(os.path.abspath(output_dir)):
-                            continue
-
+                        if not full_path.startswith(os.path.abspath(output_dir)): continue
                         if os.path.isfile(full_path):
                             zip_file.write(full_path, arcname=filename)
-
                 zip_buffer.seek(0)
                 zip_data = zip_buffer.getvalue()
                 zip_name = f"lurker_download_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
-
                 self.send_response(200)
                 self.send_header("Content-Type", "application/zip")
                 self.send_header("Content-Disposition", f'attachment; filename="{zip_name}"')
@@ -815,15 +927,86 @@ def make_handler(output_dir):
                 logger.error(f"Error creating zip archive: {e}")
                 self.send_error(500, "Internal Server Error")
 
+        def serve_login(self, error=None):
+            if not auth_enabled:
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.end_headers()
+                return
+                
+            error_html = f'<div class="error-msg">{error}</div>' if error else ""
+            html = LOGIN_HTML.replace("{error_html}", error_html)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html.encode('utf-8'))))
+            self.end_headers()
+            self.wfile.write(html.encode('utf-8'))
+
+        def serve_admin(self, error=None):
+            if not self.require_auth(['admin']):
+                return
+                
+            users = get_all_users(db_path)
+            users_html = ""
+            for u, r in users:
+                badge_class = f"role-{r}"
+                users_html += f'''
+                <div class="user-row">
+                    <div class="user-info">
+                        <strong>{u}</strong>
+                        <span class="role-badge {badge_class}">{r}</span>
+                    </div>
+                    <form method="POST" action="/admin/delete_user" style="margin:0;">
+                        <input type="hidden" name="username" value="{u}">
+                        <button type="submit" class="btn-danger" onclick="return confirm('Remove user {u}?');">Remove</button>
+                    </form>
+                </div>
+                '''
+                
+            error_html = f'<div class="error-msg">{error}</div>' if error else ""
+            html = ADMIN_HTML.replace("{users_html}", users_html).replace("{error_html}", error_html)
+            
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html.encode('utf-8'))))
+            self.end_headers()
+            self.wfile.write(html.encode('utf-8'))
+
+        def serve_change_password(self, error=None):
+            if not self.require_auth():
+                return
+            error_html = f'<div class="error-msg" style="color: {"#10b981" if "Success" in (error or "") else "var(--danger-color)"}">{error}</div>' if error else ""
+            html = CHANGE_PASSWORD_HTML.replace("{error_html}", error_html)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(html.encode('utf-8'))))
+            self.end_headers()
+            self.wfile.write(html.encode('utf-8'))
+
         def do_GET(self):
             parsed_path = urllib.parse.urlparse(self.path)
             path = parsed_path.path
-
+            
             if path == "/":
                 self.serve_dashboard()
             elif path.startswith("/download/"):
                 filename = path[len("/download/"):]
                 self.serve_file(filename)
+            elif path == "/login":
+                self.serve_login()
+            elif path == "/logout":
+                if "Cookie" in self.headers:
+                    cookie = cookies.SimpleCookie(self.headers["Cookie"])
+                    if "session_id" in cookie:
+                        delete_session(db_path, cookie["session_id"].value)
+                self.send_response(303)
+                self.send_header("Set-Cookie", "session_id=; HttpOnly; Path=/; Max-Age=0")
+                self.send_header("Location", "/login")
+                self.end_headers()
+            elif path == "/admin":
+                self.serve_admin()
+            elif path == "/change-password":
+                self.serve_change_password()
             else:
                 self.send_error(404, "File Not Found")
 
@@ -835,7 +1018,65 @@ def make_handler(output_dir):
             post_data = self.rfile.read(content_length)
             params = urllib.parse.parse_qs(post_data.decode('utf-8'))
 
-            if path == "/delete-single":
+            if path == "/login":
+                username = params.get('username', [''])[0]
+                password = params.get('password', [''])[0]
+                if verify_user(db_path, username, password):
+                    session_id = create_session(db_path, username)
+                    self.send_response(303)
+                    self.send_header("Set-Cookie", f"session_id={session_id}; HttpOnly; Path=/; Max-Age=86400")
+                    self.send_header("Location", "/")
+                    self.end_headers()
+                else:
+                    self.serve_login(error="Invalid username or password.")
+                    
+            elif path == "/admin/add_user":
+                if not self.require_auth(['admin']): return
+                username = params.get('username', [''])[0]
+                password = params.get('password', [''])[0]
+                role = params.get('role', ['user'])[0]
+                
+                if username and password and role in ('admin', 'manager', 'user'):
+                    if not add_user(db_path, username, password, role):
+                        self.serve_admin(error="Username already exists.")
+                        return
+                self.send_response(303)
+                self.send_header("Location", "/admin")
+                self.end_headers()
+                
+            elif path == "/admin/delete_user":
+                if not self.require_auth(['admin']): return
+                username = params.get('username', [''])[0]
+                if not delete_user(db_path, username):
+                    self.serve_admin(error="Cannot delete the last admin user.")
+                    return
+                self.send_response(303)
+                self.send_header("Location", "/admin")
+                self.end_headers()
+                
+            elif path == "/change-password":
+                if not self.require_auth(): return
+                username, _ = self.get_current_user()
+                current_password = params.get('current_password', [''])[0]
+                new_password = params.get('new_password', [''])[0]
+                confirm_password = params.get('confirm_password', [''])[0]
+                
+                if not verify_user(db_path, username, current_password):
+                    self.serve_change_password(error="Incorrect current password.")
+                    return
+                    
+                if new_password != confirm_password:
+                    self.serve_change_password(error="New passwords do not match.")
+                    return
+                    
+                if not new_password:
+                    self.serve_change_password(error="Password cannot be empty.")
+                    return
+                    
+                update_user_password(db_path, username, new_password)
+                self.serve_change_password(error="Successfully changed password!")
+
+            elif path == "/delete-single":
                 filename_list = params.get('delete_single', [])
                 if not filename_list:
                     self.send_error(400, "Bad Request")
@@ -844,6 +1085,7 @@ def make_handler(output_dir):
                 self.delete_file(filename)
                 
             elif path == "/delete-selected":
+                if not self.require_auth(['admin', 'manager']): return
                 filenames = params.get('files', [])
                 for filename in filenames:
                     self.delete_file(filename, redirect=False)
@@ -861,20 +1103,25 @@ def make_handler(output_dir):
     return LurkerWebHandler
 
 def main():
-    # Configuration via environment variables
     port = int(os.environ.get("LURKER_PORT", "7777"))
     web_port = int(os.environ.get("LURKER_WEB_PORT", "8080"))
     host = os.environ.get("LURKER_HOST", "0.0.0.0")
     output_dir = os.environ.get("LURKER_OUTPUT_DIR", "./received")
+    auth_enabled = os.environ.get("LURKER_AUTH_ENABLED", "0").lower() in ("1", "true", "yes")
+    db_path = os.environ.get("LURKER_DB_PATH", "./db/lurker.db")
 
-    # Ensure output directory exists
     try:
         os.makedirs(output_dir, exist_ok=True)
     except Exception as e:
         logger.error(f"Failed to create output directory {output_dir}: {e}")
         sys.exit(1)
 
-    # Start TCP receiver in a background thread
+    if auth_enabled:
+        init_db(db_path)
+        logger.info(f"Authentication is ENABLED. Using DB: {db_path}")
+    else:
+        logger.info("Authentication is DISABLED.")
+
     tcp_thread = threading.Thread(
         target=run_tcp_server,
         args=(host, port, output_dir),
@@ -882,9 +1129,8 @@ def main():
     )
     tcp_thread.start()
 
-    # Start Web server on the main thread
     server_address = (host, web_port)
-    httpd = ThreadingHTTPServer(server_address, make_handler(output_dir))
+    httpd = ThreadingHTTPServer(server_address, make_handler(output_dir, auth_enabled, db_path))
     logger.info(f"Lurker Web server running on {host}:{web_port}, serving files from {output_dir}")
 
     try:
