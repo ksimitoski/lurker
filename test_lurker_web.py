@@ -165,12 +165,12 @@ def test_detect_file_type_text(temp_output_dir):
     assert lurker_web.detect_file_type(os.path.join(temp_output_dir, "nonexistent")) == "Unknown"
 
 def test_web_handler_dashboard_empty(temp_output_dir):
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_request(handler_class, "GET", "/")
     
     assert b"200 OK" in response
     assert b"Lurker Dashboard" in response
-    assert b"0 Files Available" in response
+    assert b"0 Files" in response
     assert b"No files uploaded yet." in response
 
 def test_web_handler_dashboard_with_files(temp_output_dir):
@@ -183,11 +183,11 @@ def test_web_handler_dashboard_with_files(temp_output_dir):
     with open(file2_path, "wb") as f:
         f.write(b"\x89PNG\r\n\x1a\n")
 
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_request(handler_class, "GET", "/")
     
     assert b"200 OK" in response
-    assert b"2 Files Available" in response
+    assert b"2 Files" in response
     assert b"test1.txt" in response
     assert b"test2.png" in response
     assert b"PNG Image" in response
@@ -199,7 +199,7 @@ def test_web_handler_download_success(temp_output_dir):
     with open(os.path.join(temp_output_dir, filename), "wb") as f:
         f.write(file_content)
 
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_request(handler_class, "GET", f"/download/{filename}")
 
     assert b"200 OK" in response
@@ -209,13 +209,13 @@ def test_web_handler_download_success(temp_output_dir):
     assert response.endswith(file_content)
 
 def test_web_handler_download_not_found(temp_output_dir):
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_request(handler_class, "GET", "/download/non-existent-file")
 
     assert b"404 File Not Found" in response
 
 def test_web_handler_download_directory_traversal(temp_output_dir):
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     
     # 1. Test empty, "." and ".." filenames return 400 Bad Request
     response_dot = simulate_request(handler_class, "GET", "/download/.")
@@ -244,7 +244,7 @@ def test_web_handler_download_directory_traversal(temp_output_dir):
             os.remove(secret_file_path)
 
 def test_web_handler_not_found_route(temp_output_dir):
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_request(handler_class, "GET", "/unknown-route")
     assert b"404 File Not Found" in response
 
@@ -279,21 +279,21 @@ def test_web_handler_delete_single_success(temp_output_dir):
 
     assert os.path.exists(file_path)
 
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_post_request(handler_class, "/delete-single", {"delete_single": [filename]})
 
     assert b"303 See Other" in response or b"303" in response
     assert not os.path.exists(file_path)
 
 def test_web_handler_delete_single_missing(temp_output_dir):
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_post_request(handler_class, "/delete-single", {"delete_single": ["non-existent"]})
 
     assert b"404 File Not Found" in response
 
 def test_web_handler_delete_single_traversal(temp_output_dir):
     # Try directory traversal using path component
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     
     # 1. Dot path
     response = simulate_post_request(handler_class, "/delete-single", {"delete_single": ["."]})
@@ -325,7 +325,7 @@ def test_web_handler_delete_selected_success(temp_output_dir):
     with open(path1, "wb") as f: f.write(b"one")
     with open(path2, "wb") as f: f.write(b"two")
 
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_post_request(handler_class, "/delete-selected", {"files": [file1, file2]})
 
     assert b"303" in response
@@ -341,7 +341,7 @@ def test_web_handler_download_selected_zip_success(temp_output_dir):
     with open(path1, "wb") as f: f.write(b"content 1")
     with open(path2, "wb") as f: f.write(b"content 2")
 
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_post_request(handler_class, "/download-selected", {"files": [file1, file2]})
 
     assert b"200 OK" in response
@@ -365,7 +365,7 @@ def test_web_handler_download_selected_zip_success(temp_output_dir):
         assert z.read("uuid-file2.png") == b"content 2"
 
 def test_web_handler_download_selected_zip_empty(temp_output_dir):
-    handler_class = lurker_web.make_handler(temp_output_dir)
+    handler_class = lurker_web.make_handler(temp_output_dir, False, "")
     response = simulate_post_request(handler_class, "/download-selected", {"files": []})
 
     assert b"400" in response
