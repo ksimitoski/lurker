@@ -1,6 +1,7 @@
 services:
   lurker:
     build: .
+    image: lurker:latest
     container_name: lurker
     ports:
       # Map receiver and web ports dynamically using variables from .env
